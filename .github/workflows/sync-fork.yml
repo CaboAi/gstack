@@ -26,8 +26,9 @@ jobs:
 
           echo "Syncing $GITHUB_REPOSITORY@$BRANCH from upstream $PARENT"
 
-          # Server-side sync. Unlike `git push`, this is not blocked by the
-          # GITHUB_TOKEN restriction on updating .github/workflows/* files.
+          # Server-side sync. GITHUB_TOKEN cannot update .github/workflows/*
+          # files, so this returns 422 whenever upstream changed a workflow
+          # file; that is reported as a warning, not a job failure.
           if OUT=$(gh api --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" \
                      -f branch="$BRANCH" 2>&1); then
             echo "$OUT"
