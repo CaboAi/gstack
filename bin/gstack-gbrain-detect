@@ -1,4 +1,4 @@
-#!/usr/bin/env -S bun run
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-gbrain-detect — emit current gbrain/gstack-brain state as JSON.
  *
@@ -18,7 +18,7 @@
  *     "gstack_brain_sync_mode": "off"|"artifacts-only"|"full",
  *     "gstack_brain_git": true|false,
  *     "gstack_artifacts_remote": "https://..." | "",
- *     "gbrain_local_status": "ok"|"no-cli"|"missing-config"|"broken-config"|"broken-db"|"engine-locked"|"timeout"|"thin-client",
+ *     "gbrain_local_status": "ok"|"no-cli"|"missing-config"|"broken-config"|"broken-db"|"engine-locked"|"timeout"|"db-unreachable"|"thin-client",
  *     "gbrain_pooler_mode": "transaction"|"session"|null
  *   }
  *
@@ -40,21 +40,22 @@ import { join } from "path";
 
 import {
   localEngineStatus,
+  localEngineStatusDetail,
   resolveGbrainBin,
   readGbrainVersion,
 } from "../lib/gbrain-local-status";
-import { isTransactionModePooler } from "../lib/gbrain-exec";
+import { gbrainConfigDir, isTransactionModePooler } from "../lib/gbrain-exec";
+import { resolveStateRoot } from "../lib/state-root";
 
-const STATE_DIR = process.env.GSTACK_HOME || join(userHome(), ".gstack");
+const STATE_DIR = resolveStateRoot();
 const SCRIPT_DIR = __dirname;
 const CONFIG_BIN = join(SCRIPT_DIR, "gstack-config");
-// Honors GBRAIN_HOME — must stay consistent with lib/gbrain-local-status's
-// config resolution, or the detect JSON reports gbrain_local_status "ok"
-// alongside gbrain_config_exists false for relocated-home users.
-const GBRAIN_CONFIG = join(
-  process.env.GBRAIN_HOME || join(userHome(), ".gbrain"),
-  "config.json",
-);
+// Honors GBRAIN_HOME with gbrain's own configDir() semantics (#2521:
+// GBRAIN_HOME is a parent dir, `.gbrain` is appended) — must stay consistent
+// with lib/gbrain-local-status's config resolution, or the detect JSON
+// reports gbrain_local_status "ok" alongside gbrain_config_exists false for
+// relocated-home users. Both route through gbrainConfigDir.
+const GBRAIN_CONFIG = join(gbrainConfigDir(), "config.json");
 const CLAUDE_JSON = join(userHome(), ".claude.json");
 
 function userHome(): string {
@@ -232,8 +233,7 @@ function detectMcpMode(): "local-stdio" | "remote-http" | "none" {
 
 /** remote_mcp.mcp_url from gbrain's own config (thin-client marker, #2051). */
 function readRemoteMcpUrl(): string {
-  const gbrainHome = process.env.GBRAIN_HOME || join(userHome(), ".gbrain");
-  const cfg = tryReadJSON(join(gbrainHome, "config.json")) as
+  const cfg = tryReadJSON(join(gbrainConfigDir(), "config.json")) as
     | { remote_mcp?: { mcp_url?: string } }
     | null;
   return cfg?.remote_mcp?.mcp_url || "";
@@ -282,23 +282,33 @@ function main(): void {
   const withThinClient =
     out.gbrain_local_status === "thin-client"
       ? { ...out, gbrain_thin_client: { probed: false } }
-      : out;
+      : out.gbrain_local_status === "db-unreachable"
+        ? { ...out, gbrain_local_status_detail: localEngineStatusDetail() }
+        : out;
 
   process.stdout.write(JSON.stringify(withThinClient, null, 2) + "\n");
 }
 
 // --is-ok: live engine-status gate. Exits 0 iff gbrain is usable ("ok";
-// "timeout" — a slow-but-healthy engine, #1964; or "thin-client" — remote-HTTP
-// MCP brain with no local engine by design, #2051 — neither slow nor remote
-// must silently suppress brain features), 1 otherwise. Runs detection live
-// (never reads the possibly-stale gbrain-detection.json), so callers — setup,
-// bin/dev-setup, and `gstack-config gbrain-refresh` — can decide whether to
-// render the gbrain :user variant without duplicating the JSON grep.
-// Prints nothing on stdout.
+// "timeout" — a slow-but-healthy engine, #1964; "db-unreachable" — a network
+// error reaching a configured DB, transient like timeout; "thin-client" — remote-HTTP
+// MCP brain with no local engine by design, #2051; or "engine-locked" —
+// PGLite is single-writer, so a live `gbrain serve` (typically an MCP
+// server) holds the embedded DB, #2456 — gbrain is installed and healthy in
+// all four; none must silently suppress brain features), 1 otherwise. Runs
+// detection live (never reads the possibly-stale gbrain-detection.json), so
+// callers — setup, bin/dev-setup, and `gstack-config gbrain-refresh` — can
+// decide whether to render the gbrain :user variant without duplicating the
+// JSON grep. Prints nothing on stdout.
 if (process.argv.includes("--is-ok")) {
   const noCache = process.env.GSTACK_DETECT_NO_CACHE === "1";
   const status = localEngineStatus({ noCache });
-  process.exit(status === "ok" || status === "timeout" || status === "thin-client" ? 0 : 1);
+  process.exit(
+    status === "ok" || status === "timeout" || status === "db-unreachable" ||
+      status === "thin-client" || status === "engine-locked"
+      ? 0
+      : 1,
+  );
 }
 
 main();
