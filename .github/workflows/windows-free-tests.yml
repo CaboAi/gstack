@@ -18,10 +18,15 @@ name: Windows Free Tests
 # the artifact.
 #
 # Native browser qualification campaigns (Windows cookie extraction, launch
-# diagnostics, Dia on macOS) are dispatch-only in native-qualification.yml.
+# diagnostics) are dispatch-only in native-qualification.yml.
 
 on:
   pull_request:
+    branches: [main]
+  # Also on main pushes, as free-tests.yml does: trains dispatch only the
+  # Linux free workflow, so without this no Windows run ever sees a train's
+  # combined tree or main after a merge.
+  push:
     branches: [main]
   workflow_dispatch:
     inputs:

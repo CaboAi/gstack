@@ -135,7 +135,21 @@ export async function callJudge<T>(
   // could be exhausted before a frontier judge emitted any JSON.
   const resolvedModel = resolveEvalModel('judge', model);
   const maxTokens = opts?.max_tokens ?? DEFAULT_JUDGE_MAX_TOKENS;
-  const client = new Anthropic();
+  // What a cancelled request had received, so a judge deadline names rate-limit
+  // waits, SDK retries, a stream with no events, or a long thinking phase. Counts
+  // only, never content; an observer that throws never changes the judge outcome.
+  const started = performance.now();
+  const elapsedMs = () => Math.round(performance.now() - started);
+  const progress = { httpRequests: 0, httpStatuses: [] as number[], retryWaitsMs: [] as number[], connectedMs: null as number | null,
+    firstEventMs: null as number | null, lastEventMs: null as number | null, block: null as string | null, thinkingChars: 0,
+    textChars: 0, messageId: null as string | null, requestId: null as string | null };
+  const observe = (record: () => void) => { try { record(); } catch {} };
+  const client = new Anthropic({ fetch: async (...args: Parameters<typeof fetch>) => {
+    progress.httpRequests += 1;
+    const response = await globalThis.fetch(...args);
+    progress.httpStatuses.push(response.status);
+    return response;
+  } });
 
   const request = {
     model: resolvedModel,
@@ -146,34 +160,62 @@ export async function callJudge<T>(
       ...(opts?.effort === undefined ? {} : { effort: opts.effort }) } }),
     messages: [{ role: 'user' as const, content: prompt }],
   };
-  const makeRequest = () => opts?.stream
-    ? client.messages.stream(request, signal ? { signal } : undefined).finalMessage()
-    : client.messages.create(request, signal ? { signal } : undefined);
+  const makeRequest = () => {
+    if (!opts?.stream) return client.messages.create(request, signal ? { signal } : undefined);
+    const stream = client.messages.stream(request, signal ? { signal } : undefined);
+    stream.on('connect', () => observe(() => {
+      progress.connectedMs ??= elapsedMs();
+      progress.requestId ??= stream.request_id ?? null;
+    }));
+    stream.on('streamEvent', event => observe(() => {
+      progress.firstEventMs ??= elapsedMs();
+      progress.lastEventMs = elapsedMs();
+      progress.requestId ??= stream.request_id ?? null;
+      if (event.type === 'message_start') progress.messageId = event.message.id;
+      if (event.type === 'content_block_start') progress.block = event.content_block.type;
+      if (event.type === 'content_block_delta' && event.delta.type === 'thinking_delta') progress.thinkingChars += event.delta.thinking.length;
+      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') progress.textChars += event.delta.text.length;
+    }));
+    return stream.finalMessage();
+  };
 
   // 429s under CI concurrency: jittered exponential backoff over 3 retries
   // (~1s/4s/16s + jitter), honoring the server's retry-after when present.
   // The old single fixed 1s retry lost races reliably at 40-way concurrency.
   let response;
   let attempt = 0;
-  for (;;) {
-    try {
-      signal?.throwIfAborted();
-      response = await makeRequest();
-      signal?.throwIfAborted();
-      break;
-    } catch (err: any) {
-      signal?.throwIfAborted();
-      if (err?.status !== 429 || attempt >= 3) throw err;
-      const retryAfterSecs = Number(err?.headers?.['retry-after']);
-      const baseMs = Number.isFinite(retryAfterSecs) && retryAfterSecs > 0
-        ? retryAfterSecs * 1000
-        : 1000 * 4 ** attempt;
-      await delay(baseMs + Math.random() * 500, undefined, { signal }).catch(error => {
+  try {
+    for (;;) {
+      try {
         signal?.throwIfAborted();
-        throw error;
-      });
-      attempt += 1;
+        response = await makeRequest();
+        signal?.throwIfAborted();
+        break;
+      } catch (err: any) {
+        signal?.throwIfAborted();
+        if (err?.status !== 429 || attempt >= 3) throw err;
+        const retryAfterSecs = Number(err?.headers?.['retry-after']);
+        const baseMs = Number.isFinite(retryAfterSecs) && retryAfterSecs > 0
+          ? retryAfterSecs * 1000
+          : 1000 * 4 ** attempt;
+        const waitMs = baseMs + Math.random() * 500;
+        progress.retryWaitsMs.push(Math.round(waitMs));
+        await delay(waitMs, undefined, { signal }).catch(error => {
+          signal?.throwIfAborted();
+          throw error;
+        });
+        attempt += 1;
+      }
     }
+  } catch (error) {
+    if (signal?.aborted) {
+      console.error(JSON.stringify({
+        type: 'llm-judge-aborted', model: resolvedModel, stream: opts?.stream === true, elapsedMs: elapsedMs(),
+        attempts: attempt + 1, ...progress,
+        reason: (signal.reason instanceof Error ? signal.reason.message : String(signal.reason)).slice(0, 200),
+      }));
+    }
+    throw error;
   }
 
   opts?.onResponse?.({
@@ -187,6 +229,13 @@ export async function callJudge<T>(
     .filter(block => block.type === 'text')
     .map(block => block.text)
     .join('\n');
+  const parseJudgeText = (json: string): T => {
+    try {
+      return JSON.parse(json) as T;
+    } catch (error) {
+      throw new SyntaxError(`Judge response is not valid JSON (stop_reason=${response.stop_reason}, ${json.length} chars; full text in llm-judge-response-parse-error): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   try {
     if (response.stop_reason === 'max_tokens') {
       throw new Error(`Judge response truncated at max_tokens=${maxTokens} (model=${resolvedModel})`);
@@ -194,11 +243,11 @@ export async function callJudge<T>(
     if (response.stop_reason === 'refusal') throw new JudgeRefusalError(response);
     if (opts?.jsonSchema !== undefined) {
       if (response.stop_reason !== 'end_turn') throw new Error(`Structured judge did not complete: stop_reason=${response.stop_reason}`);
-      return JSON.parse(text) as T;
+      return parseJudgeText(text);
     }
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error(`Judge returned non-JSON: ${text.slice(0, 200)}`);
-    return JSON.parse(jsonMatch[0]) as T;
+    return parseJudgeText(jsonMatch[0]);
   } catch (error) {
     // The canonical full stderr spool retains this public response even when
     // parsing fails before a caller can record a judgment. Never copy content

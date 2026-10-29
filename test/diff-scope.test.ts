@@ -5,7 +5,7 @@
  * the correct SCOPE_* variables are output.
  */
 import { describe, test, expect, afterAll } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
@@ -245,6 +245,20 @@ describe('glob classes (table-driven, #2526 + #2455)', () => {
     { name: 'plain backend', file: 'server.go', expects: ['SCOPE_BACKEND'], alsoFalse: ['SCOPE_FRONTEND'] },
     { name: 'docs', file: 'docs/guide.md', expects: ['SCOPE_DOCS'] },
     { name: 'prompts', file: 'app/services/prompt_builder.rb', expects: ['SCOPE_PROMPTS', 'SCOPE_BACKEND'] },
+    // Python tests and nested test dirs (#3335): the issue's three paths.
+    { name: 'nested tests/test_*.py (#3335)', file: 'components/orch/services/shared/tests/test_native_store_custody.py', expects: ['SCOPE_TESTS', 'SCOPE_BACKEND'] },
+    { name: 'second nested tests/test_*.py (#3335)', file: 'components/orch/services/shared/tests/test_infra_promoted_first_apply.py', expects: ['SCOPE_TESTS', 'SCOPE_BACKEND'] },
+    { name: 'hyphenated service tests/test_*.py (#3335)', file: 'components/orch/services/api-gateway/tests/test_native_chat_checkpoint_store.py', expects: ['SCOPE_TESTS', 'SCOPE_BACKEND'] },
+    { name: 'test_*.py outside a tests dir', file: 'pkg/test_store.py', expects: ['SCOPE_TESTS', 'SCOPE_BACKEND'] },
+    { name: 'Django tests.py', file: 'shop/tests.py', expects: ['SCOPE_TESTS', 'SCOPE_BACKEND'] },
+    { name: 'pytest conftest.py', file: 'services/api/conftest.py', expects: ['SCOPE_TESTS', 'SCOPE_BACKEND'] },
+    { name: 'nested __tests__ dir', file: 'packages/ui/__tests__/render.ts', expects: ['SCOPE_TESTS', 'SCOPE_BACKEND'] },
+    { name: 'nested spec dir', file: 'engines/billing/spec/invoice_checker.rb', expects: ['SCOPE_TESTS', 'SCOPE_BACKEND'] },
+    // Controls: a name that only contains "test" is not a test file.
+    { name: 'latest.py is not a test', file: 'pkg/latest.py', expects: ['SCOPE_BACKEND'], alsoFalse: ['SCOPE_TESTS'] },
+    { name: 'contest_rules.py is not a test', file: 'pkg/contest_rules.py', expects: ['SCOPE_BACKEND'], alsoFalse: ['SCOPE_TESTS'] },
+    { name: 'testing/ dir is not a test dir', file: 'pkg/testing/fixtures_loader.py', expects: ['SCOPE_BACKEND'], alsoFalse: ['SCOPE_TESTS'] },
+    { name: 'attest_*.py is not a test', file: 'pkg/attest_signer.py', expects: ['SCOPE_BACKEND'], alsoFalse: ['SCOPE_TESTS'] },
   ];
 
   for (const row of TABLE) {
@@ -260,6 +274,18 @@ describe('glob classes (table-driven, #2526 + #2455)', () => {
       expect(vars.SCOPE_ERROR).toBeUndefined();
     });
   }
+});
+
+describe('one test-path rule (#3335)', () => {
+  test('TEST_PATH_RE is byte-identical to the test-bootstrap TESTFILES regex', () => {
+    const script = readFileSync(SCRIPT, 'utf8');
+    const scriptRe = script.match(/^TEST_PATH_RE='([^']+)'$/m)?.[1];
+    const resolver = readFileSync(join(import.meta.dir, '..', 'scripts', 'resolvers', 'testing.ts'), 'utf8');
+    const resolverRe = resolver.match(/git ls-files \| grep -cE '([^']+)'/)?.[1]?.replace(/\\\\/g, '\\');
+    expect(scriptRe).toBeDefined();
+    expect(resolverRe).toBeDefined();
+    expect(scriptRe).toBe(resolverRe);
+  });
 });
 
 describe('exit-code contract (#2526)', () => {
@@ -339,6 +365,27 @@ describe('uncommitted work is visible (#2299)', () => {
     expect(status).toBe(0);
     expect(vars.SCOPE_MIGRATIONS).toBe('true');
     expect(vars.SCOPE_BACKEND).toBe('true');
+  });
+
+  // Value: protects=--head scopes one committed range from any checkout, the input the receipt writer and the merge queue
+  // share; fails_when=--head still reads the working tree or untracked files, or an unknown head reads as all-false; seam=none
+  test('--head <sha> scopes only the committed range: working-tree and untracked files are ignored, an unknown head is an error', () => {
+    const dir = createRepo(['lib/auth.ts']);
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, stdio: 'pipe' }).stdout.toString().trim();
+    mkdirSync(join(dir, 'db', 'migrate'), { recursive: true });
+    writeFileSync(join(dir, 'db', 'migrate', '001.rb'), '# untracked\n');
+    writeFileSync(join(dir, 'styles.css'), 'a{}\n');
+    const scope = (args: string[]) => spawnSync('bash', [SCRIPT, 'main', ...args], { cwd: dir, stdio: 'pipe', timeout: 5000 });
+    const ranged = scope(['--head', head]);
+    expect(ranged.status).toBe(0);
+    const out = ranged.stdout.toString();
+    expect(out).toContain('SCOPE_AUTH=true');
+    expect(out).toContain('SCOPE_MIGRATIONS=false');
+    expect(out).toContain('SCOPE_FRONTEND=false');
+    expect(runScopeFull(dir).vars.SCOPE_MIGRATIONS).toBe('true');
+    const unknown = scope(['--head', 'f'.repeat(40)]);
+    expect(unknown.status).toBe(2);
+    expect(unknown.stdout.toString()).toContain('SCOPE_ERROR=no_head');
   });
 
   test('non-ASCII path still matches extension globs (NUL-safe file listing, #2526)', () => {

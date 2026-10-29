@@ -7,6 +7,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { usePrivateStateRoot } from './helpers/private-state-root';
 import { expectMentions } from './helpers/prompt-structure';
+import { generateFailureRouting } from '../scripts/resolvers/preamble/generate-test-failure-triage';
+import { readShippedSkillRouting } from './helpers/shipped-skill-routing';
+import { readSkillStartup } from './helpers/skill-startup';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 
@@ -716,7 +719,7 @@ describe('v0.4.1 preamble features', () => {
 
   for (const skill of tier2PlusSkills) {
     test(`${skill} contains AskUserQuestion Pros/Cons format`, () => {
-      const content = fs.readFileSync(path.join(ROOT, skill), 'utf-8');
+      const content = readSkillStartup(path.join(ROOT, skill));
       // v1.7.0.0 Pros/Cons format tokens. The preamble resolver
       // (generate-ask-user-format.ts) injects all of these into every
       // tier-2+ skill. Drop any of them and the test catches it on the
@@ -740,7 +743,7 @@ describe('v0.4.1 preamble features', () => {
       // pid that names the sessions-dir entry) is derived by the script itself,
       // so the render passes no "$PPID" (#2763); it still carries the
       // SESSION_KIND STATUS-line interpretation prose.
-      const content = fs.readFileSync(path.join(ROOT, skill), 'utf-8');
+      const content = readSkillStartup(path.join(ROOT, skill));
       expect(content).not.toContain('$PPID');
       expect(content).toContain('SESSION_KIND');
     });
@@ -757,7 +760,7 @@ describe('v0.4.1 preamble features', () => {
 
   for (const skill of skillsWithPreamble) {
     test(`${skill} contains escalation protocol`, () => {
-      const content = fs.readFileSync(path.join(ROOT, skill), 'utf-8');
+      const content = readSkillStartup(path.join(ROOT, skill));
       expect(content).toContain('DONE_WITH_CONCERNS');
       expect(content).toContain('BLOCKED');
       expect(content).toContain('NEEDS_CONTEXT');
@@ -992,7 +995,7 @@ describe('Completeness Principle in generated SKILL.md files', () => {
 
   for (const skill of skillsWithPreamble) {
     test(`${skill} contains Completeness Principle section`, () => {
-      const content = fs.readFileSync(path.join(ROOT, skill), 'utf-8');
+      const content = readSkillStartup(path.join(ROOT, skill));
       expect(content).toContain('Completeness Principle');
       expect(content).toContain('Boil the Ocean');
     });
@@ -1000,7 +1003,7 @@ describe('Completeness Principle in generated SKILL.md files', () => {
 
   test('Completeness Principle keeps compact scoring guidance in tier 2+ skills', () => {
     // CSO is intentionally exempt; use a regular tier 2+ PREAMBLE consumer.
-    const content = fs.readFileSync(path.join(ROOT, 'review', 'SKILL.md'), 'utf-8');
+    const content = readSkillStartup(path.join(ROOT, 'review', 'SKILL.md'));
     expect(content).toContain('Completeness: X/10');
     expect(content).toContain('10 = all edge cases');
     expect(content).toContain('Note: options differ in kind, not coverage');
@@ -1207,8 +1210,8 @@ describe('Test Bootstrap ({{TEST_BOOTSTRAP}}) integration', () => {
     expect(content).toContain('Step 4');
   });
 
-  test('TEST_BOOTSTRAP appears in design-review/SKILL.md', () => {
-    const content = fs.readFileSync(path.join(ROOT, 'design-review', 'SKILL.md'), 'utf-8');
+  test('TEST_BOOTSTRAP appears in design-review/sections/test-bootstrap.md', () => {
+    const content = fs.readFileSync(path.join(ROOT, 'design-review', 'sections', 'test-bootstrap.md'), 'utf-8');
     expect(content).toContain('Test Framework Bootstrap');
   });
 
@@ -1616,13 +1619,14 @@ describe('Codex skill', () => {
     expect(content).toContain('200');
   });
 
-  test('adversarial review in /ship always runs both passes', () => {
+  test('adversarial review in /ship runs the passes the review plan dispatches', () => {
     const content = readShipUnion();
-    expect(content).toContain('Adversarial review (always-on)');
+    expect(content).toContain("Step 9's last full-pass plan governs this step");
+    expect(content).toContain('## Step 11: Adversarial review\n');
     expect(content).toContain('adversarial-review');
     expect(content).toContain('run-with-timeout --effort high ');
     expect(content).toContain('Investigate and fix');
-    expect(content).toContain('Claude adversarial subagent (always runs)');
+    expect(content).toContain('Claude adversarial subagent (on `DISPATCH: adversarial-native`)');
   });
 
   test('scope drift detection in /review and /ship', () => {
@@ -2043,6 +2047,37 @@ describe('Test failure triage in ship skill', () => {
   });
 });
 
+describe('Failure routing: verified cause → fix, unknown cause → bounded triage (#3157, #3158)', () => {
+  const rule = generateFailureRouting();
+  const unknownCause = rule.slice(rule.indexOf('**Cause unknown:** ') + '**Cause unknown:** '.length);
+
+  test('the router sends bug reports through the failure rule, not straight to /investigate', () => {
+    const router = fs.readFileSync(path.join(ROOT, 'SKILL.md'), 'utf-8');
+    expect(router).toContain(rule);
+    const bugRule = router.split('\n').find(line => line.startsWith('- User reports a bug'));
+    expect(bugRule).toContain('**Failures**');
+    expect(bugRule).not.toMatch(/→ invoke `\/investigate`$/);
+  });
+
+  test('the rule keeps the root-cause bar on both paths', () => {
+    expect(rule).toMatch(/\*\*Cause supplied\*\*[^\n]*one read-only check[^\n]*If it does not, invoke `\/investigate` before any further tracing or edit/);
+    expect(unknownCause).toMatch(/^make one read-only triage pass[^\n]*Do not reproduce, test hypotheses or search wider[^\n]*still unclear, invoke `\/investigate` before any broader diagnosis or edit\.$/);
+  });
+
+  test('the routing gstack offers for CLAUDE.md, and this repo\'s own, check the cause before /investigate', () => {
+    const bugRule = readShippedSkillRouting().rules.find(line => line.startsWith('- Bugs/errors'));
+    expect(bugRule).toMatch(/→ invoke \/investigate, unless one read-only check confirms the cause/);
+    expect(fs.readFileSync(path.join(ROOT, 'CLAUDE.md'), 'utf-8').split('\n')).toContain(bugRule!);
+  });
+
+  test('/ship fixes a pre-existing failure through the same bounded triage', () => {
+    const tests = fs.readFileSync(path.join(ROOT, 'ship', 'sections', 'tests.md'), 'utf-8');
+    const fixNow = tests.slice(tests.indexOf('**If "Investigate and fix now":**'), tests.indexOf('**If "Add as P0 TODO":**'));
+    expect(fixNow).toContain('- One read-only root-cause pass, then `/investigate` if unclear.');
+    expect(fixNow).not.toContain('/investigate mindset');
+  });
+});
+
 describe('no compiled binaries in git', () => {
   // Tracked files enumerated once and reused by both assertions. git ls-files -z
   // + split is ~ms; the previous xargs-per-file shell loops blew past 5s on CI.
@@ -2212,7 +2247,7 @@ describe('ios tier demotion (Phase 5)', () => {
   const iosSkills = ['ios-fix', 'ios-clean', 'ios-sync', 'ios-design-review'];
   for (const skill of iosSkills) {
     test(`${skill} render drops tier-3 sections, keeps AUQ format`, () => {
-      const content = fs.readFileSync(path.join(ROOT, skill, 'SKILL.md'), 'utf-8');
+      const content = readSkillStartup(path.join(ROOT, skill, 'SKILL.md'));
       expect(content).not.toContain('## Repo Ownership');
       expect(content).not.toContain('## Search Before Building');
       expect(content).toContain('## AskUserQuestion Format');
