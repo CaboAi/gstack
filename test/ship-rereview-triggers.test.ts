@@ -446,7 +446,7 @@ describe('test-only and audit-requested edits after the docs audit (GST-391, gbr
     f.write({ 'test/b.test.ts': `${spec('b')}test('b is even', () => expect(2 % 2).toBe(0));\n` }); f.commit('test: add a case');
     const ask = finish(f, reviewed, post, ['--reviewed-base', mergeBase(f)]);
     expect(lineOf(ask.stdout, 'ROUTE')).toMatch(/ behavior=0 docs=0 metadata=0 tests=1 /);
-    expect([ask.status, lineOf(ask.stdout, 'STOP')]).toEqual([3, expect.stringContaining('STOP: test code changed since review in test/b.test.ts: one fix-check reviewer reads ')]);
+    expect([ask.status, lineOf(ask.stdout, 'STOP')]).toEqual([3, expect.stringContaining('STOP: test code changed since review in test/b.test.ts: one scoped reader (not a review round) reads ')]);
     const packet = /reads (\S+\.md), then/.exec(ask.stdout)![1]!;
     expect(fs.readFileSync(packet, 'utf8')).toContain("test('b is even'");
     const record = path.join(f.root, 'tests-reviewed.json');
@@ -464,7 +464,7 @@ describe('test-only and audit-requested edits after the docs audit (GST-391, gbr
       const pw = snapshot(w);
       w.write({ 'test/gate.test.ts': after }); w.commit(`test: ${name}`);
       const out = finish(w, rw, pw, ['--reviewed-base', mergeBase(w)]);
-      expect([name, out.status, lineOf(out.stdout, 'STOP')]).toEqual([name, 3, expect.stringContaining('STOP: test code changed since review in test/gate.test.ts: one fix-check reviewer reads ')]);
+      expect([name, out.status, lineOf(out.stdout, 'STOP')]).toEqual([name, 3, expect.stringContaining('STOP: test code changed since review in test/gate.test.ts: one scoped reader (not a review round) reads ')]);
     }
 
     const long = fx({}, { 'src/b.ts': 'export const b = 2;\n', 'test/b.test.ts': spec('b') });
@@ -603,6 +603,24 @@ describe('preflight carry route for an adjacent base edit (GST-442)', () => {
     expect(fs.existsSync(path.join(f.work, '.git', 'gstack', `scoped-review-${head.slice(0, 12)}.md`))).toBe(false);
     const wrote = f.run(path.join(BIN, 'gstack-ship-receipt'), ['carry', '--pr', '9', '--base', 'main']);
     expect([wrote.status, fs.existsSync(path.join(f.work, '.git', 'gstack', `scoped-review-${head.slice(0, 12)}.md`))]).toEqual([EXIT.refused, true]);
+  });
+
+  // Value: protects=the would-carry NEXT line names the push before the carry, since carry --pr refuses a HEAD that is not the
+  //   PR's pushed head (bin/gstack-ship-receipt), and the early push's secrets scan and CI wait come before the pregate;
+  //   fails_when=the NEXT line sends the agent from the pregate straight to carry; seam=gh; no_claim=the carry itself
+  test("preflight's would-carry route commits, pushes early and waits for CI before the pregate and the carry", () => {
+    const src = (edit: Record<number, string> = {}) => Array.from({ length: 12 }, (_, i) => edit[i + 1] ?? `exports.v${i + 1} = ${i + 1};`).join('\n') + '\n';
+    const f = fx({ 'lib/rows.js': src() }, { 'lib/rows.js': src({ 6: 'exports.v6 = 600;' }) });
+    const reviewed = f.git('rev-parse', 'HEAD').stdout.trim();
+    f.advanceBase({ 'lib/other.js': 'exports.other = 1;\n' });
+    mergeMain(f);
+    const head = f.git('rev-parse', 'HEAD').stdout.trim();
+    const view = path.join(f.root, 'view.json');
+    fs.writeFileSync(view, JSON.stringify({ body: placeReceiptFirst('## Summary\n\nProse.\n', { schema_version: 1, pr: 9, head: reviewed, base: 'main', queue_mode: 'stamp-at-merge' } as any), headRefOid: head }));
+    f.gh(`case "$1 $2" in "pr list") echo 9 ;; "pr view") cat '${view}' ;; *) exit 1 ;; esac`);
+    const r = f.run(PREFLIGHT, ['--base', 'main']);
+    expect(lineOf(r.stdout, 'CARRY')).toMatch(/^CARRY: would carry/);
+    expect(r.stdout).toMatch(/^NEXT: carry route \(Step 1\.4\): .*commit, gstack-ship-release push --branch \S+ --early, gstack-ci-carry wait --base main \(CI_CARRY: none is not a stop\), gstack-pregate --allow-repo-commands, then gstack-ship-receipt carry --pr 9 --base main --pregate/m);
   });
 
   // Value: protects=the dry run offers the scoped route only when nothing else would refuse the carry, so preflight never sends
@@ -857,6 +875,43 @@ describe('finish after a completed fix-check (GST-1130, GEVA-218)', () => {
     const early = finish(f, reviewed, post);
     expect(lineOf(early.stdout, 'FIX_CHECK')).toBe(`FIX_CHECK: not counted (range_base ${fork.slice(0, 12)} does not hold the reviewed tree)`);
     expect(early.status).toBe(3);
+  });
+
+  // Value: protects=a base merge after the granted fix-check that also edits a fix-checked file keeps that file's credit when its
+  //   patch against the base is the one the fix-check read (#3916 open note, merge 131a856); fails_when=finish compares the
+  //   fix-check commit's tree with the current tree path by path and prints FIX_CHECK: reviewed none, or credits a branch edit
+  //   made after the merge; seam=finish's route reading the review log; no_claim=a conflict resolution's meaning
+  test('a base merge that also edits a fix-checked file keeps the credit while the branch patch is unchanged', () => {
+    const f = fx({ 'src/x.ts': lines(9) }, { 'src/x.ts': lines(9, { 5: 'export const l5 = 50;' }), 'test/x.test.ts': TEST_V1 });
+    const passHead = f.git('rev-parse', 'HEAD').stdout.trim();
+    const reviewed = wtree(f);
+    const reviewedBase = mergeBase(f);
+    f.write({ 'src/x.ts': lines(9, { 5: 'export const l5 = 51;' }), 'test/x.test.ts': TEST_V2 }); f.commit('fix the round-2 blocker and bound its case');
+    const fixHead = f.git('rev-parse', 'HEAD').stdout.trim();
+    const post = snapshot(f);
+    const id = grant(f, passHead);
+    expect(logFixCheck(f, { completed: true, converged: true, range_base: passHead }).status).toBe(0);
+    f.advanceBase({ 'src/x.ts': lines(9, { 1: 'export const l1 = 100;' }), 'src/y.ts': 'export const y = 1;\n' });
+    mergeMain(f);
+    expect(f.git('show', 'HEAD:src/x.ts').stdout).toBe(lines(9, { 1: 'export const l1 = 100;', 5: 'export const l5 = 51;' }));
+    const r = finish(f, reviewed, post, ['--reviewed-base', reviewedBase]);
+    expect(lineOf(r.stdout, 'FIX_CHECK')).toBe(`FIX_CHECK: reviewed src/x.ts,test/x.test.ts (fix-check at ${fixHead.slice(0, 12)}, range from ${passHead.slice(0, 12)}, grant ${id})`);
+    expect([r.status, lineOf(r.stdout, 'ROUTE'), lineOf(r.stdout, 'DOCS')]).toEqual([0, expect.stringMatching(/ behavior=0 docs=0 metadata=0 tests=0 base=1 context=0 fix_checked=2$/), expect.stringMatching(/^DOCS: fresh .*carried: tests=0 base=1 /)]);
+    f.write({ 'src/x.ts': lines(9, { 1: 'export const l1 = 100;', 5: 'export const l5 = 52;' }) }); f.commit('an edit after the merge');
+    const late = finish(f, reviewed, post, ['--reviewed-base', reviewedBase]);
+    expect(lineOf(late.stdout, 'FIX_CHECK')).toStartWith('FIX_CHECK: reviewed test/x.test.ts (');
+    expect([late.status, late.stdout.includes('STOP: behavior, tests or build inputs changed since review (src/x.ts)')]).toEqual([3, true]);
+  });
+
+  // Value: protects=the docs audit carries a path only on the tree finish checks, so a --build that rewrites an audited doc after
+  //   the commit check is still stale (#3970 outside voice); fails_when=the carry compares HEAD and prints DOCS: fresh;
+  //   seam=finish's docsFresh; no_claim=push's own working-tree guard
+  test('a build that rewrites an audited doc after the commit check keeps the docs audit stale', () => {
+    const f = fx({ 'README.md': '# Fx\n' }, { 'README.md': '# Fx, from the branch\n' });
+    const reviewed = wtree(f);
+    const post = snapshot(f);
+    const r = finish(f, reviewed, post, ['--reviewed-base', mergeBase(f), '--docs-rechecked', '--build', "printf '# Generated replacement never audited\\n' > README.md"]);
+    expect([r.status, lineOf(r.stdout, 'DOCS')]).toEqual([3, 'DOCS: stale (README.md)']);
   });
 
   test('a fix-check logged on uncommitted content is not counted', () => {

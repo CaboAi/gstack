@@ -25,6 +25,11 @@ const done = (r: { status: number | null; stdout?: string | Buffer | null; stder
 export function git(cwd: string, args: string[], timeout = 120_000): Run {
   return done(spawnSync('git', args, { cwd, encoding: 'utf8', timeout, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }));
 }
+/** GST-1204: the /ship run that passed Steps 1-3 on this checkout, recorded in its own git dir (per worktree) until finish clears it; empty outside a checkout. */
+export function shipRunMarker(cwd: string): string {
+  const p = git(cwd, ['rev-parse', '--git-path', 'gstack-ship-run']);
+  return p.status === 0 && p.stdout.trim() ? path.resolve(cwd, p.stdout.trim()) : '';
+}
 export function bin(cwd: string, name: string, args: string[], timeout = 600_000): Run {
   return done(runScriptSync(path.join(BIN_DIR, name), args, { cwd, encoding: 'utf8', timeout, maxBuffer: 64 * 1024 * 1024 }));
 }
@@ -97,14 +102,16 @@ export function versionOnlyEdit(cwd: string, ref: string, p: string): boolean {
 /**
  * Release metadata a version stamp and Steps 13-14 write, compared against `ref`: the release commit's paths,
  * never a behavior change. A manifest counts only while its edit is version-only (a dependency, script or
- * lockfile change is a build input); bun.lock never counts.
+ * lockfile change is a build input); bun.lock never counts. `stampOnly` (a landed stack parent's checks, GST-1399)
+ * counts a `stamp_paths` or `release_outputs` file only while its edit is a version stamp, as `stamp_files` are.
  */
-export function releasePaths(policy: Record<string, any> | null, cwd: string, ref: string, base: string): string[] {
+export function releasePaths(policy: Record<string, any> | null, cwd: string, ref: string, base: string, stampOnly = false): string[] {
   const list = (v: unknown) => (Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : []);
   const fragment = fragmentPath(policy, cwd);
+  const declared = [...list(policy?.release_outputs), ...list(policy?.stamp_paths)];
   return [...new Set(['VERSION', 'CHANGELOG.md', 'TODOS.md', 'agents-digest/gstack-AGENTS.md', ...VERSIONED_MANIFESTS.filter(p => versionOnlyEdit(cwd, ref, p)),
-    ...(typeof policy?.changelog === 'string' ? [policy.changelog] : []), ...(fragment ? [fragment] : []), ...list(policy?.release_outputs), ...list(policy?.stamp_paths),
-    ...stampedFiles(policy, cwd, ref, base)])];
+    ...(typeof policy?.changelog === 'string' ? [policy.changelog] : []), ...(fragment ? [fragment] : []), ...(stampOnly ? [] : declared),
+    ...stampedFiles(stampOnly ? { ...policy, stamp_files: [...list(policy?.stamp_files), ...declared] } : policy, cwd, ref, base)])];
 }
 
 /**

@@ -342,6 +342,272 @@ describe('the receipt binds the selection the reviewers read', () => {
       expect({ where, says: text.includes('does not read the review ledger') }).toEqual({ where, says: true });
     }
   }, 240_000);
+
+  // Value: protects=a base policy that gains review_exclude_paths does not void a receipt whose PR touches none of the new
+  //   patterns, while a PR touching a pattern (an excluded or a kept file) and an unreadable base policy still refuse (a recorded
+  //   digest that differs: GST-1434 below); fails_when=the queue compares recorded=none to the new digest without asking whether any changed
+  //   file matches (GST-1408: harness-evals #264 stopped 9 receipted PRs), or the acceptance spreads to any of the four
+  //   refusals; why_new=GST-1408; seam=bindShippedReceipt, which gstack-ship-queue ready, train build and land call, on receipts
+  //   gstack-ship-receipt write produced; no_claim=carry (bin/gstack-ship-receipt carry keeps its own comparison)
+  describe('a base policy that gains review_exclude_paths after the receipt (GST-1408)', () => {
+    const policyOnBaseOnly = (repo: FixtureRepo, text: string) => {
+      repo.git('checkout', '-q', 'main');
+      commit(repo, { '.gstack/ship-policy.json': text }, 'base policy change');
+      repo.git('push', '-q', 'origin', 'main');
+      repo.git('checkout', '-q', 'feature');
+      repo.git('fetch', '-q', 'origin');
+    };
+    const shipped = (files: Record<string, string>, basePolicy: string[] | null = null) => {
+      const repo = makeFixtureRepo({ prefix: 'gstack-exclude-late-', baseFiles: basePolicy ? { '.gstack/ship-policy.json': policyText(basePolicy) } : {} });
+      repos.push(repo);
+      commit(repo, files);
+      const body = path.join(repo.root, 'body.md');
+      const extra = [...targetedAtHead(repo)];
+      if (basePolicy) {
+        const expected = writeReceipt(repo, body, extra).err.match(/field=review_exclude expected=([0-9a-f]{64}) /)?.[1];
+        expect(expected).toBeDefined();
+        extra.push('--review-exclude', expected!);
+      }
+      const w = writeReceipt(repo, body, extra);
+      expect({ status: w.status, err: w.err }).toMatchObject({ status: EXIT.ok });
+      return { repo, body };
+    };
+    const bind = (repo: FixtureRepo, body: string) => {
+      const head = repo.git('rev-parse', 'HEAD');
+      return bindShippedReceipt(repo.work, 'origin/main', fs.readFileSync(body, 'utf8'), undefined, [head]);
+    };
+    const CODE = { 'lib/reader.js': 'exports.p = 1;\n', 'docs/guide.md': '# guide\n' };
+
+    test('a receipt with no digest binds when the PR touches none of the new patterns', () => {
+      const { repo, body } = shipped(CODE);
+      expect(receiptIn(body).review_exclude).toBeUndefined();
+      policyOnBaseOnly(repo, policyText(['receipts/**', '**/*.jsonl']));
+      const b = bind(repo, body);
+      expect({ ok: b.ok, message: b.ok ? '' : b.message }).toEqual({ ok: true, message: '' });
+    }, 240_000);
+
+    test('a receipt with no digest still refuses when the PR touches a new pattern, excluded or kept', () => {
+      const touches: Array<Record<string, string>> = [{ 'receipts/a/result.json': '{"ok": true}\n' }, { 'receipts/run.js': 'exports.run = 1;\n' }];
+      for (const touched of touches) {
+        const { repo, body } = shipped({ ...CODE, ...touched });
+        policyOnBaseOnly(repo, policyText(['receipts/**']));
+        const b = bind(repo, body);
+        expect(b.ok).toBe(false);
+        if (b.ok) continue;
+        expect(b.code).toBe('RECEIPT_INVALID');
+        expect(b.message).toMatch(/^field=review_exclude expected=[0-9a-f]{64} recorded=none /);
+      }
+    }, 240_000);
+
+    // Value: protects=ready, train build and land bind a receipt whose recorded digest is older than the base policy's when
+    //   neither the recorded selection nor HEAD's holds a PR file (carry's rule since #4030), while a selection that holds a PR
+    //   file (excluded or kept, on either side) and an unreadable base policy still refuse; fails_when=the queue compares digests
+    //   alone (GST-1434: harness-evals #274 and #276 refused after policy PR #278 merged, recorded=5ae7e95a07b5 expected=
+    //   323c17cf6249), or the acceptance spreads to a selection that holds a PR file; why_new=GST-1434; seam=bindShippedReceipt,
+    //   which gstack-ship-queue ready, train build and land call; no_claim=carry (GST-1415 below)
+    test('the #274 shape: an older recorded digest binds after a policy edit on main when neither selection holds a PR file', () => {
+      for (const after of [['receipts/**', 'results/**'], ['results/**']]) {
+        const { repo, body } = shipped(CODE, ['receipts/**']);
+        const recorded = receiptIn(body).review_exclude!.digest;
+        expect(bind(repo, body).ok).toBe(true);
+        policyOnBaseOnly(repo, policyText(after));
+        const now = JSON.parse(plan(repo, ['--json']).out).review_exclude.digest;
+        expect({ after, moved: typeof now === 'string' && now !== recorded }).toEqual({ after, moved: true });
+        const b = bind(repo, body);
+        expect({ after, ok: b.ok, message: b.ok ? '' : b.message }).toEqual({ after, ok: true, message: '' });
+      }
+    }, 240_000);
+
+    test('a recorded digest that differs still refuses when the recorded or the current selection holds a PR file', () => {
+      const cases: Array<{ name: string; files: Record<string, string>; after: string[] }> = [
+        { name: 'recorded excludes a PR file', files: { 'receipts/a/result.json': '{"ok": true}\n' }, after: ['results/**'] },
+        { name: 'current excludes a PR file', files: { 'results/a.json': '{"ok": true}\n' }, after: ['receipts/**', 'results/**'] },
+        { name: 'both keep a PR file', files: { 'receipts/run.js': 'exports.run = 1;\n' }, after: ['receipts/**', 'results/**'] },
+      ];
+      for (const c of cases) {
+        const { repo, body } = shipped({ ...CODE, ...c.files }, ['receipts/**']);
+        const recorded = receiptIn(body).review_exclude!.digest;
+        policyOnBaseOnly(repo, policyText(c.after));
+        const b = bind(repo, body);
+        expect({ name: c.name, ok: b.ok, code: b.ok ? '' : b.code }).toEqual({ name: c.name, ok: false, code: 'RECEIPT_INVALID' });
+        if (!b.ok) expect(b.message).toMatch(new RegExp(`^field=review_exclude expected=[0-9a-f]{64} recorded=${recorded} `));
+      }
+    }, 240_000);
+
+    test('an unreadable base policy still refuses a receipt with no digest or an older one', () => {
+      for (const basePolicy of [null, ['receipts/**']]) {
+        const { repo, body } = shipped(CODE, basePolicy);
+        policyOnBaseOnly(repo, '{ "review_exclude_paths": "receipts/**" }\n');
+        const b = bind(repo, body);
+        expect({ basePolicy, ok: b.ok, code: b.ok ? '' : b.code }).toEqual({ basePolicy, ok: false, code: 'POLICY_INVALID' });
+      }
+    }, 240_000);
+  });
+
+  // Value: protects=a base policy change that selects no file the PR changed (a pattern gained, added beside another, removed or
+  //   reverted) no longer voids the receipt at carry, and the queue binds the carried receipt, while a changed pattern that selects
+  //   a PR file (excluded or kept) and an unreadable or malformed base policy still refuse; fails_when=carry compares the policy
+  //   digest alone (GST-1415: harness-evals #263 re-ran a full five-reader review of an unchanged product), or the acceptance
+  //   spreads to a selection that holds a PR file; why_new=GST-1415; seam=gstack-ship-receipt carry after a base merge, then
+  //   bindShippedReceipt on the carried receipt; no_claim=the queue's own comparison of uncarried receipts (GST-1408 above)
+  describe('carry after a base policy change (GST-1415)', () => {
+    const CODE = { 'lib/reader.js': 'exports.p = 1;\n', 'docs/guide.md': '# guide\n' };
+    const NO_KEY = JSON.stringify({}) + '\n';
+    const shipped = (files: Record<string, string>, basePolicy: string[] | null) => {
+      const repo = makeFixtureRepo({ prefix: 'gstack-exclude-carry-', baseFiles: basePolicy ? { '.gstack/ship-policy.json': policyText(basePolicy) } : {} });
+      repos.push(repo);
+      commit(repo, files);
+      const body = path.join(repo.root, 'body.md');
+      const extra = [...targetedAtHead(repo)];
+      if (basePolicy) {
+        const expected = writeReceipt(repo, body, extra).err.match(/field=review_exclude expected=([0-9a-f]{64}) /)?.[1];
+        expect(expected).toBeDefined();
+        extra.push('--review-exclude', expected!);
+      }
+      const w = writeReceipt(repo, body, extra);
+      expect({ status: w.status, err: w.err }).toMatchObject({ status: EXIT.ok });
+      return { repo, body, recorded: receiptIn(body).review_exclude?.digest ?? 'none' };
+    };
+    const carry = (repo: FixtureRepo, body: string) => runBin(repo, 'gstack-ship-receipt', ['carry', '--body', body, '--base', 'main']);
+
+    test('a pattern change that selects no PR file carries, and the queue binds the carried receipt', () => {
+      const cases: Array<{ name: string; before: string[] | null; after: string }> = [
+        { name: 'gained', before: null, after: policyText(['receipts/**']) },
+        { name: 'added beside another', before: ['receipts/**'], after: policyText(['receipts/**', 'results/**']) },
+        { name: 'removed beside another', before: ['receipts/**', 'results/**'], after: policyText(['receipts/**']) },
+        { name: 'reverted', before: ['receipts/**'], after: NO_KEY },
+      ];
+      for (const c of cases) {
+        const { repo, body, recorded } = shipped(CODE, c.before);
+        onBase(repo, { '.gstack/ship-policy.json': c.after });
+        const carried = carry(repo, body);
+        expect({ name: c.name, status: carried.status, err: carried.status === EXIT.ok ? '' : carried.err }).toEqual({ name: c.name, status: EXIT.ok, err: '' });
+        const head = repo.git('rev-parse', 'HEAD');
+        const now = receiptIn(body);
+        expect({ name: c.name, head: now.head, moved: (now.review_exclude?.digest ?? 'none') !== recorded }).toEqual({ name: c.name, head, moved: true });
+        const b = bindShippedReceipt(repo.work, 'origin/main', fs.readFileSync(body, 'utf8'), undefined, [head]);
+        expect({ name: c.name, ok: b.ok, message: b.ok ? '' : b.message }).toEqual({ name: c.name, ok: true, message: '' });
+      }
+    }, 240_000);
+
+    test('a pattern change that selects a PR file, excluded or kept, still refuses carry', () => {
+      const touches: Array<Record<string, string>> = [{ 'receipts/a/result.json': '{"ok": true}\n' }, { 'receipts/run.js': 'exports.run = 1;\n' }];
+      const changes: Array<[string[] | null, string]> = [[null, policyText(['receipts/**'])], [['receipts/**'], NO_KEY]];
+      for (const touched of touches) {
+        for (const [before, after] of changes) {
+          const { repo, body, recorded } = shipped({ ...CODE, ...touched }, before);
+          onBase(repo, { '.gstack/ship-policy.json': after });
+          const refused = carry(repo, body);
+          expect({ touched: Object.keys(touched)[0], before, status: refused.status }).toEqual({ touched: Object.keys(touched)[0], before, status: EXIT.refused });
+          expect(refused.err).toContain(`review_exclude changed: recorded=${recorded} `);
+          expect(refused.err).toContain('(RECEIPT_CARRY_REFUSED;');
+        }
+      }
+    }, 240_000);
+
+    test('an unreadable or malformed base policy still refuses carry', () => {
+      for (const text of [JSON.stringify({ review_exclude_paths: 'receipts/**', min_gstack_version: REVIEW_EXCLUDE_KEY_VERSION }) + '\n', '{ not json\n']) {
+        const { repo, body } = shipped(CODE, null);
+        onBase(repo, { '.gstack/ship-policy.json': text });
+        const refused = carry(repo, body);
+        expect({ text, status: refused.status }).toEqual({ text, status: EXIT.refused });
+        expect(refused.err).toContain('RECEIPT_CARRY_REFUSED');
+        expect(refused.err).toContain('so its review_exclude_paths cannot be read');
+      }
+    }, 240_000);
+  });
+
+  // Value: protects=a receipt write after /ship's Step 14.5 docs audit binds the digest the reviewers read when the only change to
+  //   the selection since the review is files under review_exclude_paths that the audit's post snapshot names (GST-1429: gbrain
+  //   #8627's audit added a key-files entry, a docs file code names, and write refused with RECEIPT_INVALID field=review_exclude,
+  //   forcing a third review pass), a docs edit the review read uncommitted stays when --docs-pre names the Prepare snapshot and
+  //   checkout line endings compare as committed (the #4034 review), while a selection change from anything else, an audit file the exclusion reads as code, an
+  //   edit after the snapshot and a missing snapshot still refuse; fails_when=write accepts a changed selection without the
+  //   snapshot, or the exception spreads to files the snapshot does not name or the exclusion does not hide or keep as docs;
+  //   why_new=GST-1429; seam=gstack-docs-candidate snapshot, then gstack-ship-receipt write --review-exclude --docs-post;
+  //   no_claim=what the docs audit itself may edit (ship/sections/documentation.md)
+  describe('a docs audit after the review (GST-1429)', () => {
+    const BRANCH = { 'lib/reader.js': "exports.p = 'docs/parity.md';\n", 'docs/parity.md': '# parity\n', 'docs/old.md': '# old\n' };
+    /** A branch reviewed at its head with `dirty` uncommitted (the plan's digest is what verify prints), then audited: the Prepare snapshot is saved, `audit` edits the tree, the post snapshot is saved, `after` edits more, and everything is committed. */
+    const audited = (audit: Record<string, string | null>, after: Record<string, string | null> = {}, branch: Record<string, string> = BRANCH, opts: { dirty?: Record<string, string>; autocrlf?: boolean } = {}) => {
+      const repo = makeFixtureRepo({ prefix: 'gstack-exclude-audit-', baseFiles: { '.gstack/ship-policy.json': policyText(['docs/**', 'test/fixtures/goldens/**']), 'docs/key-files.md': '# key files\n', 'lib/index.js': "exports.k = 'docs/key-files.md';\n" } });
+      repos.push(repo);
+      commit(repo, branch);
+      if (opts.autocrlf) repo.git('config', 'core.autocrlf', 'true');
+      for (const [rel, text] of Object.entries(opts.dirty ?? {})) write(repo.work, rel, text);
+      const reviewed = JSON.parse(plan(repo, ['--json']).out).review_exclude.digest as string;
+      const snapshot = (out: string) => {
+        const snap = runBin(repo, 'gstack-docs-candidate', ['snapshot', '--out', out, '--audit-id', 'a1', '--mode', 'edit', '--base', repo.git('rev-parse', 'origin/main'), '--docs', 'docs']);
+        expect({ status: snap.status, err: snap.err }).toMatchObject({ status: 0 });
+      };
+      const pre = path.join(repo.root, 'a1.json');
+      snapshot(pre);
+      for (const [rel, text] of Object.entries(audit)) { if (text === null) fs.rmSync(path.join(repo.work, rel), { force: true }); else write(repo.work, rel, text); }
+      const post = path.join(repo.root, 'a1-post.json');
+      snapshot(post);
+      commit(repo, after, 'docs audit and release');
+      return { repo, reviewed, pre, post, body: path.join(repo.root, 'body.md') };
+    };
+    const writeWith = (a: ReturnType<typeof audited>, post: string | null = a.post, pre: string | null = null) =>
+      writeReceipt(a.repo, a.body, ['--review-exclude', a.reviewed, ...(post === null ? [] : ['--docs-post', post]), ...(pre === null ? [] : ['--docs-pre', pre]), ...targetedAtHead(a.repo)]);
+    const refusedWith = (w: { status: number | null; err: string }, a: ReturnType<typeof audited>, why: string) => {
+      expect({ status: w.status, written: fs.existsSync(a.body) }).toEqual({ status: EXIT.fail, written: false });
+      expect(w.err).toContain(`field=review_exclude expected=`);
+      expect(w.err).toContain(`recorded=${a.reviewed} `);
+      expect(w.err).toContain(why);
+    };
+
+    test('the #8627 shape: an audit edit to a docs file code names binds the reviewed digest with the post snapshot only', () => {
+      const a = audited({ 'docs/key-files.md': '# key files\n- lib/reader.js: the parity guard\n' }, {}, { 'lib/reader.js': BRANCH['lib/reader.js'], 'docs/parity.md': BRANCH['docs/parity.md'] });
+      const prior = process.env.GSTACK_STATE_ROOT;
+      process.env.GSTACK_STATE_ROOT = path.join(a.repo.root, 'receipt-state');
+      let head: ReturnType<typeof receiptReviewAtHead>['exclude'];
+      try { head = receiptReviewAtHead(a.repo.work, 'main', path.join(import.meta.dir, '..', 'bin'), a.repo.git('rev-parse', 'HEAD')).exclude; }
+      finally { if (prior === undefined) delete process.env.GSTACK_STATE_ROOT; else process.env.GSTACK_STATE_ROOT = prior; }
+      expect(head.state === 'active' ? head.kept.map(k => [k.path, k.reason]) : head.state).toEqual([['docs/key-files.md', 'named-by-code'], ['docs/parity.md', 'named-by-code']]);
+      expect(head.state === 'active' && head.record.digest).not.toBe(a.reviewed);
+      refusedWith(writeWith(a, null), a, '(write compares the argument, not the review ledger)');
+      const w = writeWith(a);
+      expect({ status: w.status, err: w.status === EXIT.ok ? '' : w.err }).toEqual({ status: EXIT.ok, err: '' });
+      expect(w.err + w.out).toContain(`REVIEW_EXCLUDE_DOCS_AUDIT: reviewed=${a.reviewed.slice(0, 12)} `);
+      expect(receiptIn(a.body).review_exclude!.digest).toBe(head.state === 'active' ? head.record.digest : 'none');
+    }, 240_000);
+
+    test('an audit that adds an excluded docs file and removes one the branch added binds', () => {
+      const a = audited({ 'docs/new.md': '# new\n', 'docs/old.md': null });
+      const w = writeWith(a);
+      expect({ status: w.status, err: w.status === EXIT.ok ? '' : w.err }).toEqual({ status: EXIT.ok, err: '' });
+      expect(w.err + w.out).toContain('files=docs/new.md,docs/old.md');
+    }, 240_000);
+
+    test('a selection change outside the audit, or an audit file the exclusion reads as code, still refuses', () => {
+      const code = audited({ 'docs/new.md': '# new\n' }, { 'lib/old.js': "exports.o = 'docs/old.md';\n" });
+      refusedWith(writeWith(code), code, 'is not the selection HEAD has with the files under review_exclude_paths that changed since the snapshot reset');
+      const outside = audited({ 'docs/new.md': '# new\n', 'lib/reader.js': "exports.p = 'docs/parity.md';\nexports.o = 'docs/old.md';\n" });
+      refusedWith(writeWith(outside), outside, 'is not the selection HEAD has with the files under review_exclude_paths that changed since the snapshot reset');
+      const tool = audited({ 'docs/tool.js': 'exports.t = 1;\n' });
+      refusedWith(writeWith(tool), tool, 'docs/tool.js is code at HEAD');
+    }, 240_000);
+
+    test('an edit after the snapshot, a file the snapshot does not name and a missing snapshot still refuse', () => {
+      const late = audited({ 'docs/new.md': '# new\n' }, { 'docs/new.md': '# new, edited after the snapshot\n' });
+      refusedWith(writeWith(late), late, 'docs/new.md at HEAD is not the content the snapshot recorded');
+      const unnamed = audited({}, { 'docs/new.md': '# new\n' });
+      refusedWith(writeWith(unnamed), unnamed, 'docs/new.md changed after the snapshot');
+      refusedWith(writeWith(unnamed, path.join(unnamed.repo.root, 'missing-post.json')), unnamed, 'missing-post.json: cannot be read');
+    }, 240_000);
+
+    test('a docs edit the review read uncommitted stays with the Prepare snapshot, and checkout line endings compare as committed', () => {
+      const dirty = audited({ 'docs/new.md': '# new\n' }, {}, BRANCH, { dirty: { 'docs/key-files.md': '# key files\n- lib/reader.js: the parity guard\n' } });
+      refusedWith(writeWith(dirty), dirty, 'is not the selection HEAD has with the files under review_exclude_paths that changed since the snapshot reset');
+      const kept = writeWith(dirty, dirty.post, dirty.pre);
+      expect({ status: kept.status, err: kept.status === EXIT.ok ? '' : kept.err }).toEqual({ status: EXIT.ok, err: '' });
+      expect(kept.err + kept.out).toContain('files=docs/new.md ');
+      const crlf = audited({ 'docs/new.md': '# new\r\n' }, {}, BRANCH, { autocrlf: true });
+      const w = writeWith(crlf, crlf.post, crlf.pre);
+      expect({ status: w.status, err: w.status === EXIT.ok ? '' : w.err }).toEqual({ status: EXIT.ok, err: '' });
+    }, 240_000);
+  });
 });
 
 describe('a branch cannot hide code under a base pattern', () => {
@@ -431,8 +697,20 @@ describe('a branch cannot hide code under a base pattern', () => {
     for (const [rel, bytes] of Object.entries({ ...kept, ...content })) fs.writeFileSync(path.join(repo.work, rel), bytes);
     commit(repo, {});
     const p = JSON.parse(plan(repo, ['--json']).out);
-    expect(p.review_exclude.kept_files).toEqual(Object.keys(kept).map(f => ({ path: f, reason: 'code' })));
+    expect(p.review_exclude.kept_files).toEqual(Object.keys(kept).map(f => ({ path: f, reason: /id_ed25519|\.p12$/.test(f) ? 'gate-path' : 'code' })));
     expect(p.review_exclude).toMatchObject({ excluded: 2, content: { binary: 2 } });
+  }, 120_000);
+
+  // Value: protects=a binary token store under an excluded glob stays in every reader's diff (GST-1350 narrowed the token name
+  //   rule to source and style files); fails_when=a token-named binary with no text lines is excluded as content; seam=bin/gstack-review-plan
+  test('a binary token store under an excluded glob is kept as a gate path', () => {
+    const repo = makeFixtureRepo({ prefix: 'gstack-exclude-', baseFiles: { '.gstack/ship-policy.json': policyText(['assets/**']) } }); repos.push(repo);
+    fs.mkdirSync(path.join(repo.work, 'assets'), { recursive: true });
+    for (const rel of ['assets/tokens.db', 'assets/shot.png']) fs.writeFileSync(path.join(repo.work, rel), GZ);
+    commit(repo, {});
+    const p = JSON.parse(plan(repo, ['--json']).out);
+    expect(p.review_exclude.kept_files).toEqual([{ path: 'assets/tokens.db', reason: 'gate-path' }]);
+    expect(p.review_exclude).toMatchObject({ excluded: 1, content: { binary: 1 } });
   }, 120_000);
 
   // Value: protects=a branch's .gitattributes cannot get a matched file with a credential line excluded by making git call it
@@ -468,6 +746,55 @@ describe('a branch cannot hide code under a base pattern', () => {
     if (blind.state !== 'active') return;
     expect(blind.excluded.size).toBe(0);
     expect(blind.kept.filter(k => k.reason === 'gate-scan-unavailable').map(k => k.path).sort()).toEqual([...EXCLUDED, 'receipts/b/result.json', 'receipts/d/fixture.json'].sort());
+  }, 120_000);
+
+  // Value: protects=the named-by-code scan reads only the code and test files that can name a candidate, so its cost follows
+  //   the consumers and not the data a results PR adds; fails_when=git grep reads the whole tree, so 4,354 receipts and 30 MB of
+  //   data under the patterns are searched for every candidate path (GST-1435: harness-evals #269 ran 278 s past the 120 s limit
+  //   and kept every file as consumer-scan-unavailable), or the scoped scan stops finding a full-path reference; why_new=GST-1435;
+  //   seam=reviewExclude in head mode, observed through GIT_TRACE; no_claim=wall-clock time (the PR body has the timings)
+  test('the consumer scan greps only consumer files, never the data under the patterns, and still finds full-path references', () => {
+    const repo = census();
+    const bulk: Record<string, string> = {};
+    for (let k = 0; k < 200; k++) bulk[`receipts/bulk/${k}/result.json`] = JSON.stringify({ next: `receipts/bulk/${k + 1}/result.json`, peer: 'receipts/b/result.json' }) + '\n';
+    commit(repo, bulk, 'bulk receipts');
+    const head = repo.git('rev-parse', 'HEAD');
+    const baseSha = repo.git('rev-parse', 'origin/main');
+    const c = collectCommit(repo.work, baseSha, head);
+    const trace = path.join(repo.root, 'git-trace.log');
+    const prior = process.env.GIT_TRACE;
+    process.env.GIT_TRACE = trace;
+    let x: ReturnType<typeof reviewExclude>;
+    try { x = reviewExclude({ root: repo.work, baseSha, ref: 'origin/main', mergeBase: c.mergeBase!, head, perPath: c.perPath, added: c.added, classRoot: c.root ?? [], gateTagged: new Set(), context: 'test' }); }
+    finally { if (prior === undefined) delete process.env.GIT_TRACE; else process.env.GIT_TRACE = prior; }
+    expect(x.state).toBe('active');
+    if (x.state !== 'active') return;
+    expect(x.kept.filter(k => k.reason !== 'executable')).toEqual([{ path: 'receipts/b/result.json', reason: 'named-by-code' }, { path: 'receipts/d/fixture.json', reason: 'named-by-code' }]);
+    expect(x.excluded.has('receipts/bulk/7/result.json')).toBe(true);
+    const greps = fs.readFileSync(trace, 'utf8').split('\n').filter(l => /built-in: git( -c \S+)* grep /.test(l));
+    expect(greps.length).toBeGreaterThan(0);
+    const read = greps.map(l => [...(l.split(' -- ')[1] ?? '').matchAll(/:\(top,literal\)([^' ]+)/g)].map(m => m[1]!));
+    expect(read.every(paths => paths.length > 0)).toBe(true);
+    const all = new Set(read.flat());
+    expect(['lib/reader.js', 'test/d.test.js'].every(p => all.has(p))).toBe(true);
+    expect([...all].filter(p => p.startsWith('receipts/') && p !== 'receipts/run.sh')).toEqual([]);
+  }, 120_000);
+
+  // GST-1435 review (outside-voice#1): a consumer whose name is not valid UTF-8 comes back from ls-tree as U+FFFD, so its literal
+  //   pathspec matches nothing; fails_when=the scan treats that as no match and excludes the data the file names instead of keeping
+  //   every candidate; seam=reviewExclude in head mode
+  test.skipIf(process.platform === 'win32' || process.platform === 'darwin')('a consumer whose name is not valid UTF-8 keeps the candidates, not excludes them', () => {
+    const repo = census();
+    commit(repo, { 'receipts/z/result.json': '{}\n' }, 'receipt');
+    fs.writeFileSync(Buffer.concat([Buffer.from(path.join(repo.work, 'lib/reader-')), Buffer.from([0xff]), Buffer.from('.js')]), "read('receipts/z/result.json')\n");
+    commit(repo, {}, 'reader with a non-UTF-8 name');
+    const head = repo.git('rev-parse', 'HEAD');
+    const baseSha = repo.git('rev-parse', 'origin/main');
+    const c = collectCommit(repo.work, baseSha, head);
+    const x = reviewExclude({ root: repo.work, baseSha, ref: 'origin/main', mergeBase: c.mergeBase!, head, perPath: c.perPath, added: c.added, classRoot: c.root ?? [], gateTagged: new Set(), context: 'test' });
+    expect(x.state).toBe('active');
+    if (x.state !== 'active') return;
+    expect(x.excluded.has('receipts/z/result.json')).toBe(false);
   }, 120_000);
 
   test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('a live binary file whose bytes cannot be read is kept, not excluded', () => {
